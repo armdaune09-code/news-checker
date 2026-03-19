@@ -1,27 +1,53 @@
 import { NextResponse } from "next/server";
+import OpenAI from "openai";
 import { JSDOM } from "jsdom";
 import { Readability } from "@mozilla/readability";
 
+export const dynamic = "force-dynamic";
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
+type ExtractionMethod = "readability" | "fallback" | "failed" | "raw";
+type Decision = "공유 추천" | "주의" | "비추천";
+type Verdict = "사실 가능성 높음" | "불확실" | "허위 가능성 높음";
+
+type EvidenceSource = {
+  title: string;
+  description: string;
+  articleUrl: string;
+  sourceName: string;
+  sourceUrl: string;
+  publishedAt: string;
+};
+
+function clamp(n: number, min = 0, max = 100) {
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
 function cleanText(text: string) {
   return text
-    .replace(/\s+/g, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, " ")
+    .replace(/<svg[\s\S]*?<\/svg>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
     .replace(/&nbsp;/gi, " ")
     .replace(/&amp;/gi, "&")
     .replace(/&quot;/gi, '"')
     .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
-function extractOgTitle(html: string) {
-  const ogMatch = html.match(
-    /<meta[^>]*property=["']og:title["'][^>]*content=["']([^"']+)["'][^>]*>/i
-  );
-  if (ogMatch?.[1]) return cleanText(ogMatch[1]);
+function isUrl(text: string) {
+  return /^https?:\/\//i.test(text);
+}
 
-  const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
-  if (titleMatch?.[1]) return cleanText(titleMatch[1]);
-
-  return "";
+function isKorean(text: string) {
+  return /[가-힣]/.test(text);
 }
 
 function getRiskLevel(score: number) {
@@ -30,207 +56,324 @@ function getRiskLevel(score: number) {
   return "높음";
 }
 
-function clamp(num: number, min = 0, max = 100) {
-  return Math.max(min, Math.min(max, num));
+function safeJsonParse<T>(raw: string, fallback: T): T {
+  try {
+    return JSON.parse(
+      raw.replace(/```json/gi, "").replace(/```/g, "").trim()
+    ) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+async function extractFromUrl(url: string): Promise<{
+  text: string;
+  extractionMethod: ExtractionMethod;
+  sourceDomain: string;
+}> {
+  let sourceDomain = "";
+  try {
+    sourceDomain = new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    sourceDomain = "";
+  }
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      },
+      redirect: "follow",
+      cache: "no-store",
+    });
+
+    if (!res.ok) {
+      return { text: "", extractionMethod: "failed", sourceDomain };
+    }
+
+    const html = await res.text();
+
+    try {
+      const dom = new JSDOM(html, { url });
+      const reader = new Readability(dom.window.document);
+      const article = reader.parse();
+
+      if (article?.textContent && article.textContent.trim().length > 300) {
+        return {
+          text: cleanText(article.textContent),
+          extractionMethod: "readability",
+          sourceDomain,
+        };
+      }
+    } catch {
+      // ignore
+    }
+
+    const fallbackText = cleanText(html);
+    if (fallbackText.length > 600) {
+      return {
+        text: fallbackText,
+        extractionMethod: "fallback",
+        sourceDomain,
+      };
+    }
+
+    return { text: "", extractionMethod: "failed", sourceDomain };
+  } catch {
+    return { text: "", extractionMethod: "failed", sourceDomain };
+  }
+}
+
+async function buildSearchSeed(text: string) {
+  const prompt = `
+너는 뉴스 검증용 검색어 생성기다.
+입력 글에서 핵심 주장만 뽑아 검색용 키워드를 만든다.
+반드시 JSON만 출력해라.
+
+형식:
+{
+  "claim": "핵심 주장 한 줄",
+  "searchQuery": "웹 검색용 키워드",
+  "coreSummary": "이 글의 핵심 내용 요약",
+  "clickbaitScore": 0
+}
+
+규칙:
+- claim은 검증 가능한 주장만
+- searchQuery는 인물/기관/장소/금액/사건명을 최대한 살린다
+- coreSummary는 자연스러운 한국어 1~2문장
+- clickbaitScore는 0~100
+- 한국어 입력이면 한국어로
+
+분석 대상:
+${text.slice(0, 3500)}
+`;
+
+  const resp = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    input: prompt,
+  });
+
+  return safeJsonParse<{
+    claim: string;
+    searchQuery: string;
+    coreSummary: string;
+    clickbaitScore: number;
+  }>(resp.output_text || "{}", {
+    claim: text.slice(0, 100),
+    searchQuery: text.slice(0, 100),
+    coreSummary: text.slice(0, 180),
+    clickbaitScore: 20,
+  });
+}
+
+async function searchGNews(query: string, lang: "ko" | "en") {
+  const apiKey = process.env.GNEWS_API_KEY;
+  if (!apiKey) return [] as EvidenceSource[];
+
+  const params = new URLSearchParams({
+    q: query,
+    lang,
+    max: "5",
+    sortby: "relevance",
+    in: "title,description",
+  });
+
+  const url = `https://gnews.io/api/v4/search?${params.toString()}`;
+
+  try {
+    const res = await fetch(url, {
+      headers: {
+        "X-Api-Key": apiKey,
+      },
+      cache: "no-store",
+    });
+
+    if (!res.ok) return [] as EvidenceSource[];
+
+    const data = (await res.json()) as {
+      articles?: Array<{
+        title?: string;
+        description?: string;
+        url?: string;
+        publishedAt?: string;
+        source?: {
+          name?: string;
+          url?: string;
+        };
+      }>;
+    };
+
+    return (data.articles || [])
+      .map((a) => ({
+        title: a.title || "",
+        description: a.description || "",
+        articleUrl: a.url || "",
+        sourceName: a.source?.name || "",
+        sourceUrl: a.source?.url || "",
+        publishedAt: a.publishedAt || "",
+      }))
+      .filter((a) => a.title && a.articleUrl);
+  } catch {
+    return [] as EvidenceSource[];
+  }
+}
+
+async function analyzeWithEvidence(args: {
+  inputText: string;
+  claim: string;
+  coreSummary: string;
+  clickbaitScore: number;
+  evidence: EvidenceSource[];
+  extractionMethod: ExtractionMethod;
+  sourceDomain: string;
+}) {
+  const evidenceText =
+    args.evidence.length > 0
+      ? args.evidence
+          .map(
+            (e, i) =>
+              `${i + 1}. [${e.sourceName}] ${e.title} | ${e.description} | ${e.publishedAt} | ${e.articleUrl}`
+          )
+          .join("\n")
+      : "검색된 관련 기사 없음";
+
+  const prompt = `
+너는 "웹 근거 기반 뉴스 검증기"다.
+입력 글과 웹 기사들을 비교해서 결과를 JSON만 출력해라.
+
+형식:
+{
+  "trustScore": 0,
+  "verdict": "사실 가능성 높음 | 불확실 | 허위 가능성 높음",
+  "decision": "공유 추천 | 주의 | 비추천",
+  "summary": "공유 전 판단용 한줄 결론",
+  "facts": ["확인된 내용 1", "확인된 내용 2"],
+  "cautions": ["주의 포인트 1", "주의 포인트 2"],
+  "shareSummary": "사람이 그대로 복사해 공유할 수 있는 자연스러운 뉴스형 1~2문장 요약"
+}
+
+규칙:
+- summary는 판정 한줄
+- shareSummary는 사건 내용을 요약해야지 분석 설명을 쓰면 안 된다
+- facts는 웹 기사로 확인되는 내용 중심
+- cautions는 추정/불일치/출처 부족 같은 부분
+- 과장되거나 단정적인 말투 금지
+- 최대한 자연스러운 한국어
+
+입력 주장:
+${args.claim}
+
+입력 글 핵심 요약:
+${args.coreSummary}
+
+입력 글 원문:
+${args.inputText.slice(0, 3000)}
+
+본문 추출 방식:
+${args.extractionMethod}
+출처 도메인:
+${args.sourceDomain || "-"}
+
+웹 기사 목록:
+${evidenceText}
+`;
+
+  const resp = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    input: prompt,
+  });
+
+  return safeJsonParse<{
+    trustScore: number;
+    verdict: Verdict;
+    decision: Decision;
+    summary: string;
+    facts: string[];
+    cautions: string[];
+    shareSummary: string;
+  }>(resp.output_text || "{}", {
+    trustScore: 50,
+    verdict: "불확실",
+    decision: "주의",
+    summary: "입력 내용만으로는 사실 여부를 단정하기 어렵습니다.",
+    facts: [],
+    cautions: [],
+    shareSummary: args.coreSummary || "핵심 요약을 만들지 못했습니다.",
+  });
 }
 
 export async function POST(req: Request) {
   try {
-    const { input } = await req.json();
+    const body = await req.json();
+    const input = typeof body?.input === "string" ? body.input.trim() : "";
 
-    if (!input || typeof input !== "string" || !input.trim()) {
-      return NextResponse.json(
-        { error: "입력이 없습니다." },
-        { status: 400 }
-      );
+    if (!input) {
+      return NextResponse.json({ error: "입력값 없음" }, { status: 400 });
     }
 
-    const trimmedInput = input.trim();
-
-    let extractedText = "";
-    let extractedTitle = "";
+    let text = input;
+    let extractionMethod: ExtractionMethod = "raw";
     let sourceDomain = "";
-    let extractionConfidence: "high" | "medium" | "low" = "low";
-    let extractionMethod:
-      | "readability"
-      | "body-fallback"
-      | "raw-input"
-      | "failed" = "raw-input";
 
-    const isUrl = /^https?:\/\//i.test(trimmedInput);
+    if (isUrl(input)) {
+      const extracted = await extractFromUrl(input);
+      extractionMethod = extracted.extractionMethod;
+      sourceDomain = extracted.sourceDomain;
 
-    if (isUrl) {
-      try {
-        const url = new URL(trimmedInput);
-        sourceDomain = url.hostname.replace(/^www\./, "");
-
-        const res = await fetch(trimmedInput, {
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-            Accept:
-              "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cache-Control": "no-cache",
-          },
-          redirect: "follow",
-        });
-
-        if (!res.ok) {
-          throw new Error(`본문 요청 실패: ${res.status}`);
-        }
-
-        const html = await res.text();
-        extractedTitle = extractOgTitle(html);
-
-        // 1차: Readability 본문 추출
-        try {
-          const dom = new JSDOM(html, { url: trimmedInput });
-          const reader = new Readability(dom.window.document);
-          const article = reader.parse();
-
-          if (article?.textContent) {
-            extractedText = cleanText(article.textContent);
-            if (!extractedTitle && article.title) {
-              extractedTitle = cleanText(article.title);
-            }
-            extractionMethod = "readability";
-          }
-        } catch {
-          // readability 실패 시 아래 fallback 진행
-        }
-
-        // 2차 fallback: body 텍스트 추출
-        if (!extractedText || extractedText.length < 300) {
-          const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-          const bodyRaw = bodyMatch ? bodyMatch[1] : "";
-
-          const bodyClean = cleanText(
-            bodyRaw
-              .replace(/<script[\s\S]*?<\/script>/gi, " ")
-              .replace(/<style[\s\S]*?<\/style>/gi, " ")
-              .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
-              .replace(/<iframe[\s\S]*?<\/iframe>/gi, " ")
-              .replace(/<[^>]+>/g, " ")
-          );
-
-          if (bodyClean.length > extractedText.length) {
-            extractedText = bodyClean;
-            extractionMethod = "body-fallback";
-          }
-        }
-
-        // 신뢰도 판단
-        if (extractedText.length > 3000) {
-          extractionConfidence = "high";
-        } else if (extractedText.length > 1000) {
-          extractionConfidence = "medium";
-        } else {
-          extractionConfidence = "low";
-        }
-      } catch (e) {
-        extractedText = "";
-        extractedTitle = "";
-        extractionConfidence = "low";
-        extractionMethod = "failed";
-      }
-    } else {
-      extractedText = trimmedInput;
-      extractionConfidence = "high";
-      extractionMethod = "raw-input";
-    }
-
-    const analysisText =
-      extractedText && extractedText.length > 300 ? extractedText : trimmedInput;
-
-    // 낚시성 키워드 점수
-    let clickbaitScore = 0;
-    const baitKeywords = [
-      "충격",
-      "경악",
-      "헉",
-      "논란",
-      "대박",
-      "미쳤다",
-      "소름",
-      "실화",
-      "결국",
-      "드디어",
-      "폭로",
-      "단독",
-      "반전",
-      "역대급",
-      "초비상",
-    ];
-
-    for (const word of baitKeywords) {
-      if (analysisText.includes(word)) {
-        clickbaitScore += 8;
+      if (extracted.text.length > 200) {
+        text = extracted.text;
       }
     }
 
-    // 제목에 낚시 키워드가 있으면 가중치
-    for (const word of baitKeywords) {
-      if (extractedTitle.includes(word) || trimmedInput.includes(word)) {
-        clickbaitScore += 6;
-      }
-    }
+    const seed = await buildSearchSeed(text);
+    const lang: "ko" | "en" = isKorean(seed.searchQuery || text) ? "ko" : "en";
+    const evidence = await searchGNews(seed.searchQuery || text.slice(0, 100), lang);
 
-    clickbaitScore = clamp(clickbaitScore);
+    const analyzed = await analyzeWithEvidence({
+      inputText: text,
+      claim: seed.claim || "",
+      coreSummary: seed.coreSummary || "",
+      clickbaitScore: clamp(seed.clickbaitScore || 0),
+      evidence,
+      extractionMethod,
+      sourceDomain,
+    });
 
-    // 신뢰도 점수
-    let trustScore = 75;
-
-    if (extractionConfidence === "medium") trustScore -= 8;
-    if (extractionConfidence === "low") trustScore -= 18;
-
-    if (clickbaitScore >= 50) trustScore -= 12;
-    else if (clickbaitScore >= 30) trustScore -= 6;
-
-    // 텍스트가 너무 짧으면 신뢰도 추가 하락
-    if (analysisText.length < 200) trustScore -= 20;
-    else if (analysisText.length < 500) trustScore -= 10;
-
-    trustScore = clamp(trustScore);
+    const trustScore = clamp(analyzed.trustScore || 50);
+    const clickbaitScore = clamp(seed.clickbaitScore || 0);
 
     return NextResponse.json({
       trustScore,
       riskLevel: getRiskLevel(trustScore),
       clickbaitScore,
-
+      verdict: analyzed.verdict || "불확실",
+      decision: analyzed.decision || "주의",
+      summary: analyzed.summary || "추가 확인이 필요합니다.",
+      facts: Array.isArray(analyzed.facts) ? analyzed.facts.slice(0, 4) : [],
+      cautions: Array.isArray(analyzed.cautions)
+        ? analyzed.cautions.slice(0, 4)
+        : [],
+      coreSummary: seed.coreSummary || "",
+      shareSummary: analyzed.shareSummary || seed.coreSummary || "",
+      evidenceSources: evidence.slice(0, 5),
       meta: {
         sourceDomain,
-        extractedTitle,
-        extractionConfidence,
         extractionMethod,
-        extractedLength: extractedText.length,
-        usedFallbackInput: !(extractedText && extractedText.length > 300),
+        length: text.length,
+        searchQuery: seed.searchQuery || "",
+        webEvidenceCount: evidence.length,
+        webVerificationEnabled: Boolean(process.env.GNEWS_API_KEY),
       },
-
-      summary:
-        extractionMethod === "readability"
-          ? "기사 본문 추출 후 분석되었습니다."
-          : extractionMethod === "body-fallback"
-          ? "본문 추출 정확도가 낮아 페이지 텍스트 기반으로 분석되었습니다."
-          : extractionMethod === "raw-input"
-          ? "입력된 텍스트 기준으로 분석되었습니다."
-          : "⚠ 링크 본문 추출에 실패하여 입력값 기준으로 분석되었습니다.",
-
-      warnings:
-        extractionConfidence === "low"
-          ? [
-              "링크 본문 추출 정확도가 낮습니다.",
-              "정확한 분석을 위해 기사 본문을 직접 붙여넣는 방식이 더 안정적입니다.",
-            ]
-          : [],
     });
-  } catch (error) {
-    console.error("analyze route error:", error);
-
+  } catch (e) {
     return NextResponse.json(
       {
-        error: "분석 처리 중 오류가 발생했습니다.",
-        detail: error instanceof Error ? error.message : "unknown error",
+        error: "분석 실패",
+        detail: e instanceof Error ? e.message : "unknown",
       },
       { status: 500 }
     );
