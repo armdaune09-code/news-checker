@@ -1,7 +1,16 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
-import { JSDOM } from "jsdom";
-import { Readability } from "@mozilla/readability";
+
+// ✅ HTML → 텍스트 추출 함수
+function extractText(html: string) {
+  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+
+  const text = bodyMatch
+    ? bodyMatch[1].replace(/<[^>]+>/g, " ")
+    : html;
+
+  return text.replace(/\s+/g, " ").trim();
+}
 
 export const dynamic = "force-dynamic";
 
