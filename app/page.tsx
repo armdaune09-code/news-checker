@@ -31,6 +31,7 @@ type AnalyzeResponse = {
     webEvidenceCount?: number;
     webVerificationEnabled?: boolean;
     aiEnabled?: boolean;
+    extractedTitle?: string;
   };
   error?: string;
   detail?: string;
@@ -103,6 +104,27 @@ export default function HomePage() {
     }
   };
 
+  const buildViralText = (data: AnalyzeResponse) => {
+    const facts = (data.facts || []).slice(0, 3).map((v) => `- ${v}`).join("\n");
+    const cautions = (data.cautions || []).slice(0, 2).map((v) => `- ${v}`).join("\n");
+
+    return [
+      `📊 신뢰도: ${data.trustScore}%`,
+      "",
+      `🧠 한줄 판단`,
+      data.summary || "-",
+      "",
+      `📝 핵심 요약`,
+      data.coreSummary || data.shareSummary || "-",
+      "",
+      `📌 확인된 내용`,
+      facts || "- 확인된 내용 부족",
+      "",
+      `⚠ 주의`,
+      cautions || "- 특별한 주의 포인트 없음",
+    ].join("\n");
+  };
+
   const getTrustLabel = (score: number) => {
     if (score >= 80) return "높음";
     if (score >= 60) return "보통";
@@ -129,10 +151,15 @@ export default function HomePage() {
 
   const getExtractionText = (method?: string) => {
     switch (method) {
+      case "naver-selector":
+        return "네이버 본문 추출";
       case "readability":
         return "본문 추출 성공";
       case "fallback":
+      case "body-fallback":
         return "보조 방식 추출";
+      case "meta-fallback":
+        return "제목/설명 기반";
       case "failed":
         return "링크 분석 실패";
       case "raw":
@@ -300,67 +327,141 @@ export default function HomePage() {
                   </p>
                 </div>
               </div>
+            </section>
 
-              <div className="mt-5 rounded-2xl bg-black p-4 text-white">
-                <p className="text-xs uppercase tracking-wider text-gray-400">한줄 판단</p>
-                <p className="mt-2 text-base font-semibold leading-relaxed">
-                  {result.summary || "분석 요약이 없습니다."}
-                </p>
+            <section className="overflow-hidden rounded-3xl bg-black text-white shadow-sm">
+              <div className="border-b border-white/10 px-5 py-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.2em] text-white/50">
+                      share card
+                    </p>
+                    <h3 className="mt-1 text-xl font-bold">이 글, 진짜인지 돌려봄</h3>
+                  </div>
+
+                  <div className="rounded-full bg-white/10 px-3 py-1 text-xs font-medium">
+                    {result.verdict || "불확실"}
+                  </div>
+                </div>
+              </div>
+
+              <div className="space-y-5 px-5 py-5">
+                <div>
+                  <p className="text-sm text-white/60">🧠 한줄 판단</p>
+                  <p className="mt-2 text-lg font-semibold leading-relaxed">
+                    {result.summary || "-"}
+                  </p>
+                </div>
+
+                <div>
+                  <p className="text-sm text-white/60">📝 핵심 요약</p>
+                  <p className="mt-2 text-base leading-7 text-white/90">
+                    {result.coreSummary || "-"}
+                  </p>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-2xl bg-white/5 p-4">
+                    <p className="text-sm text-white/60">📊 신뢰도</p>
+                    <p className="mt-2 text-3xl font-bold">{result.trustScore}%</p>
+                    <p className="mt-1 text-sm text-white/70">{result.decision || "-"}</p>
+                  </div>
+
+                  <div className="rounded-2xl bg-white/5 p-4">
+                    <p className="text-sm text-white/60">🚨 낚시성</p>
+                    <p className="mt-2 text-3xl font-bold">{result.clickbaitScore}점</p>
+                    <p className="mt-1 text-sm text-white/70">
+                      {getClickbaitLabel(result.clickbaitScore)}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-2xl bg-white/5 p-4">
+                    <p className="text-sm font-semibold text-white">📌 확인된 내용</p>
+                    <ul className="mt-3 space-y-2 text-sm leading-6 text-white/85">
+                      {(result.facts || []).length > 0 ? (
+                        result.facts!.slice(0, 3).map((item, index) => (
+                          <li key={index}>- {item}</li>
+                        ))
+                      ) : (
+                        <li>- 확인된 내용이 부족합니다.</li>
+                      )}
+                    </ul>
+                  </div>
+
+                  <div className="rounded-2xl bg-white/5 p-4">
+                    <p className="text-sm font-semibold text-white">⚠ 주의</p>
+                    <ul className="mt-3 space-y-2 text-sm leading-6 text-white/85">
+                      {(result.cautions || []).length > 0 ? (
+                        result.cautions!.slice(0, 3).map((item, index) => (
+                          <li key={index}>- {item}</li>
+                        ))
+                      ) : (
+                        <li>- 특별한 주의 포인트가 없습니다.</li>
+                      )}
+                    </ul>
+                  </div>
+                </div>
+
+                <div className="rounded-2xl bg-white p-4 text-gray-900">
+                  <p className="text-sm font-semibold">📤 공유용 문장</p>
+                  <p className="mt-2 text-sm leading-7">{result.shareSummary || "-"}</p>
+
+                  <div className="mt-4 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => copyText(result.shareSummary)}
+                      className="rounded-xl bg-black px-4 py-2 text-sm font-medium text-white"
+                    >
+                      공유용 복사
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => copyText(buildViralText(result))}
+                      className="rounded-xl border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700"
+                    >
+                      카드형 복사
+                    </button>
+                  </div>
+                </div>
               </div>
             </section>
 
             <section className="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
-              <h3 className="text-base font-semibold">📌 확인된 내용</h3>
-              <ul className="mt-4 space-y-2 text-sm text-gray-700">
-                {(result.facts || []).length > 0 ? (
-                  result.facts?.map((item, index) => (
-                    <li key={index} className="rounded-xl bg-gray-50 px-3 py-2">
-                      - {item}
-                    </li>
-                  ))
-                ) : (
-                  <li className="rounded-xl bg-gray-50 px-3 py-2">확인된 내용이 부족합니다.</li>
-                )}
-              </ul>
-            </section>
+              <h3 className="text-base font-semibold">상세 확인 내용</h3>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <div>
+                  <h4 className="text-sm font-semibold text-gray-900">📌 확인된 내용</h4>
+                  <ul className="mt-3 space-y-2 text-sm text-gray-700">
+                    {(result.facts || []).length > 0 ? (
+                      result.facts?.map((item, index) => (
+                        <li key={index} className="rounded-xl bg-gray-50 px-3 py-2">
+                          - {item}
+                        </li>
+                      ))
+                    ) : (
+                      <li className="rounded-xl bg-gray-50 px-3 py-2">확인된 내용이 부족합니다.</li>
+                    )}
+                  </ul>
+                </div>
 
-            <section className="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
-              <h3 className="text-base font-semibold">⚠ 주의</h3>
-              <ul className="mt-4 space-y-2 text-sm text-gray-700">
-                {(result.cautions || []).length > 0 ? (
-                  result.cautions?.map((item, index) => (
-                    <li key={index} className="rounded-xl bg-yellow-50 px-3 py-2">
-                      - {item}
-                    </li>
-                  ))
-                ) : (
-                  <li className="rounded-xl bg-yellow-50 px-3 py-2">특별한 주의 포인트가 없습니다.</li>
-                )}
-              </ul>
-            </section>
-
-            <section className="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
-              <h3 className="text-base font-semibold">📝 글 핵심 요약</h3>
-              <div className="mt-4 rounded-2xl border border-gray-200 bg-gray-50 p-4">
-                <p className="text-sm leading-7 text-gray-800">
-                  {result.coreSummary || "-"}
-                </p>
-              </div>
-            </section>
-
-            <section className="rounded-3xl border border-gray-200 bg-white p-5 shadow-sm">
-              <h3 className="text-base font-semibold">📤 공유용 요약</h3>
-              <div className="mt-4 rounded-2xl border border-gray-200 bg-gray-50 p-4">
-                <p className="text-sm leading-7 text-gray-800">
-                  {result.shareSummary || "-"}
-                </p>
-                <button
-                  type="button"
-                  onClick={() => copyText(result.shareSummary)}
-                  className="mt-4 rounded-xl border border-gray-300 px-3 py-2 text-sm text-gray-700 hover:bg-white"
-                >
-                  복사
-                </button>
+                <div>
+                  <h4 className="text-sm font-semibold text-gray-900">⚠ 주의</h4>
+                  <ul className="mt-3 space-y-2 text-sm text-gray-700">
+                    {(result.cautions || []).length > 0 ? (
+                      result.cautions?.map((item, index) => (
+                        <li key={index} className="rounded-xl bg-yellow-50 px-3 py-2">
+                          - {item}
+                        </li>
+                      ))
+                    ) : (
+                      <li className="rounded-xl bg-yellow-50 px-3 py-2">
+                        특별한 주의 포인트가 없습니다.
+                      </li>
+                    )}
+                  </ul>
+                </div>
               </div>
             </section>
 
