@@ -30,6 +30,7 @@ type AnalyzeResponse = {
     searchQuery?: string;
     webEvidenceCount?: number;
     webVerificationEnabled?: boolean;
+    aiEnabled?: boolean;
   };
   error?: string;
   detail?: string;
@@ -237,6 +238,9 @@ export default function HomePage() {
           <section className="mt-6 rounded-3xl border border-red-200 bg-red-50 p-5 shadow-sm">
             <h2 className="text-base font-semibold text-red-700">오류</h2>
             <p className="mt-2 text-sm text-red-700">{result.error}</p>
+            {result.detail ? (
+              <p className="mt-1 text-xs text-red-500">{result.detail}</p>
+            ) : null}
           </section>
         )}
 

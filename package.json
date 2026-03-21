@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@mozilla/readability": "^0.6.0",
-    "jsdom": "^29.0.0",
+    "jsdom": "^29.0.1",
     "next": "16.1.6",
     "openai": "^6.32.0",
     "react": "19.2.3",
