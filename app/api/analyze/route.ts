@@ -1,20 +1,15 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
 
-// ✅ HTML → 텍스트 추출 함수
-function extractText(html: string) {
-  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
-
-  const text = bodyMatch
-    ? bodyMatch[1].replace(/<[^>]+>/g, " ")
-    : html;
-
-  return text.replace(/\s+/g, " ").trim();
-}
-
 export const dynamic = "force-dynamic";
 
-type ExtractionMethod = "readability" | "fallback" | "failed" | "raw";
+type ExtractionMethod =
+  | "naver-selector"
+  | "body-fallback"
+  | "meta-fallback"
+  | "raw"
+  | "failed";
+
 type Verdict = "사실 가능성 높음" | "불확실" | "허위 가능성 높음";
 type Decision = "공유 추천" | "주의" | "비추천";
 
@@ -47,6 +42,7 @@ type AnalyzeResponse = {
     webEvidenceCount: number;
     webVerificationEnabled: boolean;
     aiEnabled: boolean;
+    extractedTitle?: string;
   };
   error?: string;
   detail?: string;
@@ -66,6 +62,14 @@ function getRiskLevel(score: number) {
   return "높음";
 }
 
+function isUrl(text: string) {
+  return /^https?:\/\//i.test(text);
+}
+
+function isKorean(text: string) {
+  return /[가-힣]/.test(text);
+}
+
 function cleanText(text: string) {
   return text
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -82,14 +86,6 @@ function cleanText(text: string) {
     .trim();
 }
 
-function isUrl(text: string) {
-  return /^https?:\/\//i.test(text);
-}
-
-function isKorean(text: string) {
-  return /[가-힣]/.test(text);
-}
-
 function safeJsonParse<T>(raw: string, fallback: T): T {
   try {
     return JSON.parse(
@@ -100,131 +96,109 @@ function safeJsonParse<T>(raw: string, fallback: T): T {
   }
 }
 
-function calcClickbaitScore(text: string) {
-  const keywords = [
-    "충격",
-    "단독",
-    "경악",
-    "난리",
-    "대박",
-    "전액 현금",
-    "100억",
-    "역대급",
-    "결국",
-    "실화",
-    "반전",
-    "폭로",
+function extractMetaContent(html: string, key: string) {
+  const patterns = [
+    new RegExp(
+      `<meta[^>]*property=["']${key}["'][^>]*content=["']([^"']+)["'][^>]*>`,
+      "i"
+    ),
+    new RegExp(
+      `<meta[^>]*content=["']([^"']+)["'][^>]*property=["']${key}["'][^>]*>`,
+      "i"
+    ),
+    new RegExp(
+      `<meta[^>]*name=["']${key}["'][^>]*content=["']([^"']+)["'][^>]*>`,
+      "i"
+    ),
+    new RegExp(
+      `<meta[^>]*content=["']([^"']+)["'][^>]*name=["']${key}["'][^>]*>`,
+      "i"
+    ),
   ];
 
-  let score = 0;
-  for (const word of keywords) {
-    if (text.includes(word)) score += 10;
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) return cleanText(match[1]);
   }
-  if (text.length < 80) score += 10;
 
-  return clamp(score);
+  return "";
 }
 
-function fallbackCoreSummary(text: string) {
-  const cleaned = cleanText(text);
-  if (cleaned.length <= 120) return cleaned;
-  return `${cleaned.slice(0, 117)}...`;
+function extractTitle(html: string) {
+  const og = extractMetaContent(html, "og:title");
+  if (og) return og;
+
+  const twitter = extractMetaContent(html, "twitter:title");
+  if (twitter) return twitter;
+
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  if (titleMatch?.[1]) return cleanText(titleMatch[1]);
+
+  return "";
 }
 
-function fallbackShareSummary(text: string) {
-  const cleaned = cleanText(text);
-  if (cleaned.length <= 160) return cleaned;
-  return `${cleaned.slice(0, 157)}...`;
+function extractDescription(html: string) {
+  return (
+    extractMetaContent(html, "og:description") ||
+    extractMetaContent(html, "description") ||
+    extractMetaContent(html, "twitter:description") ||
+    ""
+  );
 }
 
-function fallbackAnalyze(
-  text: string,
-  sourceDomain = "",
-  extractionMethod: ExtractionMethod = "raw",
-  evidenceSources: EvidenceSource[] = [],
-  searchQuery = ""
-): AnalyzeResponse {
-  const clickbaitScore = calcClickbaitScore(text);
+function extractBodyText(html: string) {
+  const bodyMatch = html.match(/<body[^>]*>([\s\S]*?)<\/body>/i);
+  const source = bodyMatch ? bodyMatch[1] : html;
+  return cleanText(source);
+}
 
-  let trustScore = 55;
-  const facts: string[] = [];
-  const cautions: string[] = [];
+function extractNaverText(html: string) {
+  const patterns = [
+    /<div[^>]*id=["']dic_area["'][^>]*>([\s\S]*?)<\/div>/i,
+    /<article[^>]*id=["']dic_area["'][^>]*>([\s\S]*?)<\/article>/i,
+    /<div[^>]*class=["'][^"']*newsct_article[^"']*["'][^>]*>([\s\S]*?)<\/div>/i,
+    /<div[^>]*id=["']articleBodyContents["'][^>]*>([\s\S]*?)<\/div>/i,
+  ];
 
-  if (text.length > 500) {
-    trustScore += 10;
-    facts.push("분석 가능한 텍스트 길이가 확보됨");
-  } else if (text.length < 80) {
-    trustScore -= 20;
-    cautions.push("입력 텍스트가 너무 짧음");
+  for (const pattern of patterns) {
+    const match = html.match(pattern);
+    if (match?.[1]) {
+      const text = cleanText(match[1]);
+      if (text.length > 100) return text;
+    }
   }
 
-  if (sourceDomain) {
-    facts.push(`출처 도메인 확인: ${sourceDomain}`);
-  } else {
-    cautions.push("출처 정보가 없음");
+  return "";
+}
+
+async function fetchWithTimeout(url: string, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(url, {
+      headers: {
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        Accept:
+          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+      },
+      redirect: "follow",
+      cache: "no-store",
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
   }
-
-  if (evidenceSources.length > 0) {
-    trustScore += 15;
-    facts.push(`관련 웹 기사 ${evidenceSources.length}건 발견`);
-  } else {
-    cautions.push("관련 웹 기사 근거를 충분히 찾지 못함");
-  }
-
-  if (clickbaitScore >= 40) {
-    trustScore -= 15;
-    cautions.push("자극적 표현 가능성 높음");
-  }
-
-  trustScore = clamp(trustScore);
-
-  let verdict: Verdict = "불확실";
-  if (trustScore >= 75) verdict = "사실 가능성 높음";
-  else if (trustScore < 40) verdict = "허위 가능성 높음";
-
-  let decision: Decision = "주의";
-  if (trustScore >= 80 && clickbaitScore < 35) decision = "공유 추천";
-  else if (trustScore < 50) decision = "비추천";
-
-  const coreSummary = fallbackCoreSummary(text);
-  const shareSummary =
-    evidenceSources.length > 0
-      ? `${evidenceSources[0].title}`
-      : fallbackShareSummary(text);
-
-  return {
-    trustScore,
-    riskLevel: getRiskLevel(trustScore),
-    clickbaitScore,
-    verdict,
-    decision,
-    summary:
-      verdict === "사실 가능성 높음"
-        ? "현재 기준 관련 기사 근거가 일부 확인됩니다."
-        : verdict === "허위 가능성 높음"
-        ? "현재 기준 근거가 약해 그대로 믿기엔 위험합니다."
-        : "추가 확인이 필요한 정보입니다.",
-    facts,
-    cautions,
-    coreSummary,
-    shareSummary,
-    evidenceSources,
-    meta: {
-      sourceDomain,
-      extractionMethod,
-      length: text.length,
-      searchQuery,
-      webEvidenceCount: evidenceSources.length,
-      webVerificationEnabled: Boolean(process.env.GNEWS_API_KEY),
-      aiEnabled: Boolean(process.env.OPENAI_API_KEY),
-    },
-  };
 }
 
 async function extractFromUrl(url: string): Promise<{
   text: string;
   extractionMethod: ExtractionMethod;
   sourceDomain: string;
+  extractedTitle: string;
 }> {
   let sourceDomain = "";
   try {
@@ -234,61 +208,214 @@ async function extractFromUrl(url: string): Promise<{
   }
 
   try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      },
-      redirect: "follow",
-      cache: "no-store",
-    });
-
+    const res = await fetchWithTimeout(url);
     if (!res.ok) {
-      return { text: "", extractionMethod: "failed", sourceDomain };
-    }
-
-    const html = await res.text();
-
-    try {
-      const dom = new JSDOM(html, { url });
-      const reader = new Readability(dom.window.document);
-      const article = reader.parse();
-
-      if (article?.textContent && article.textContent.trim().length > 300) {
-        return {
-          text: cleanText(article.textContent),
-          extractionMethod: "readability",
-          sourceDomain,
-        };
-      }
-    } catch {
-      // ignore
-    }
-
-    const fallbackText = cleanText(html);
-    if (fallbackText.length > 600) {
       return {
-        text: fallbackText,
-        extractionMethod: "fallback",
+        text: "",
+        extractionMethod: "failed",
         sourceDomain,
+        extractedTitle: "",
       };
     }
 
-    return { text: "", extractionMethod: "failed", sourceDomain };
+    const html = await res.text();
+    const extractedTitle = extractTitle(html);
+    const description = extractDescription(html);
+
+    if (sourceDomain.includes("naver.com")) {
+      const naverText = extractNaverText(html);
+      if (naverText.length > 100) {
+        return {
+          text: naverText,
+          extractionMethod: "naver-selector",
+          sourceDomain,
+          extractedTitle,
+        };
+      }
+    }
+
+    const bodyText = extractBodyText(html);
+    if (bodyText.length > 300) {
+      return {
+        text: bodyText,
+        extractionMethod: "body-fallback",
+        sourceDomain,
+        extractedTitle,
+      };
+    }
+
+    const metaFallback = cleanText(
+      [extractedTitle, description, url].filter(Boolean).join(" ")
+    );
+
+    if (metaFallback.length > 20) {
+      return {
+        text: metaFallback,
+        extractionMethod: "meta-fallback",
+        sourceDomain,
+        extractedTitle,
+      };
+    }
+
+    return {
+      text: "",
+      extractionMethod: "failed",
+      sourceDomain,
+      extractedTitle,
+    };
   } catch {
-    return { text: "", extractionMethod: "failed", sourceDomain };
+    return {
+      text: "",
+      extractionMethod: "failed",
+      sourceDomain,
+      extractedTitle: "",
+    };
   }
 }
 
-async function buildSearchSeed(text: string) {
+function calcClickbaitScore(text: string) {
+  const keywords = [
+    "충격",
+    "단독",
+    "경악",
+    "난리",
+    "대박",
+    "실화",
+    "전액 현금",
+    "100억",
+    "역대급",
+    "결국",
+    "반전",
+    "폭로",
+    "발칵",
+    "초비상",
+  ];
+
+  let score = 0;
+  for (const word of keywords) {
+    if (text.includes(word)) score += 10;
+  }
+
+  if (text.length < 80) score += 10;
+
+  return clamp(score);
+}
+
+function fallbackCoreSummary(text: string) {
+  const cleaned = cleanText(text);
+  if (cleaned.length <= 180) return cleaned;
+  return `${cleaned.slice(0, 177)}...`;
+}
+
+function fallbackShareSummary(text: string, title = "") {
+  const source = cleanText([title, text].filter(Boolean).join(" "));
+  if (source.length <= 180) return source;
+  return `${source.slice(0, 177)}...`;
+}
+
+function buildFallbackResult(args: {
+  text: string;
+  sourceDomain: string;
+  extractionMethod: ExtractionMethod;
+  evidenceSources: EvidenceSource[];
+  searchQuery: string;
+  extractedTitle: string;
+  clickbaitScore: number;
+}): AnalyzeResponse {
+  const facts: string[] = [];
+  const cautions: string[] = [];
+
+  let trustScore = 55;
+
+  if (args.extractionMethod === "naver-selector") {
+    trustScore += 10;
+    facts.push("네이버 기사 본문 추출 성공");
+  } else if (args.extractionMethod === "body-fallback") {
+    facts.push("본문 텍스트 기반 분석");
+  } else if (args.extractionMethod === "meta-fallback") {
+    cautions.push("제목/설명 기반으로 분석됨");
+    trustScore -= 8;
+  } else if (args.extractionMethod === "failed") {
+    cautions.push("링크 본문 추출 실패");
+    trustScore -= 12;
+  }
+
+  if (args.sourceDomain) {
+    facts.push(`출처 도메인 확인: ${args.sourceDomain}`);
+  }
+
+  if (args.text.length > 500) {
+    facts.push("분석 가능한 텍스트 길이 확보");
+    trustScore += 8;
+  } else if (args.text.length < 100) {
+    cautions.push("텍스트 길이가 짧아 판단 근거가 약함");
+    trustScore -= 15;
+  }
+
+  if (args.evidenceSources.length > 0) {
+    facts.push(`관련 웹 기사 ${args.evidenceSources.length}건 확인`);
+    trustScore += 15;
+  } else {
+    cautions.push("관련 웹 기사 근거를 충분히 찾지 못함");
+  }
+
+  if (args.clickbaitScore >= 40) {
+    cautions.push("자극적 표현 가능성이 높음");
+    trustScore -= 15;
+  }
+
+  trustScore = clamp(trustScore);
+
+  let verdict: Verdict = "불확실";
+  if (trustScore >= 75) verdict = "사실 가능성 높음";
+  else if (trustScore < 40) verdict = "허위 가능성 높음";
+
+  let decision: Decision = "주의";
+  if (trustScore >= 80 && args.clickbaitScore < 35) decision = "공유 추천";
+  else if (trustScore < 50) decision = "비추천";
+
+  return {
+    trustScore,
+    riskLevel: getRiskLevel(trustScore),
+    clickbaitScore: args.clickbaitScore,
+    verdict,
+    decision,
+    summary:
+      verdict === "사실 가능성 높음"
+        ? "현재 기준 관련 근거가 일부 확인됩니다."
+        : verdict === "허위 가능성 높음"
+        ? "현재 기준 그대로 믿기엔 위험한 정보입니다."
+        : "추가 확인이 필요한 정보입니다.",
+    facts: facts.slice(0, 4),
+    cautions: cautions.slice(0, 4),
+    coreSummary: fallbackCoreSummary(args.text),
+    shareSummary:
+      args.evidenceSources[0]?.title ||
+      args.extractedTitle ||
+      fallbackShareSummary(args.text, args.extractedTitle),
+    evidenceSources: args.evidenceSources.slice(0, 5),
+    meta: {
+      sourceDomain: args.sourceDomain,
+      extractionMethod: args.extractionMethod,
+      length: args.text.length,
+      searchQuery: args.searchQuery,
+      webEvidenceCount: args.evidenceSources.length,
+      webVerificationEnabled: Boolean(process.env.GNEWS_API_KEY),
+      aiEnabled: Boolean(process.env.OPENAI_API_KEY),
+      extractedTitle: args.extractedTitle,
+    },
+  };
+}
+
+async function buildSearchSeed(text: string, extractedTitle = "") {
+  const seedText = [extractedTitle, text].filter(Boolean).join(" ");
+
   if (!openai) {
     return {
-      claim: fallbackCoreSummary(text),
-      searchQuery: fallbackCoreSummary(text).slice(0, 60),
-      coreSummary: fallbackCoreSummary(text),
-      clickbaitScore: calcClickbaitScore(text),
+      claim: fallbackCoreSummary(seedText),
+      searchQuery: fallbackCoreSummary(seedText).slice(0, 60),
+      coreSummary: fallbackCoreSummary(seedText),
+      clickbaitScore: calcClickbaitScore(seedText),
     };
   }
 
@@ -313,7 +440,7 @@ async function buildSearchSeed(text: string) {
 - clickbaitScore는 0~100
 
 분석 대상:
-${text.slice(0, 3500)}
+${seedText.slice(0, 3500)}
 `;
 
     const resp = await openai.responses.create({
@@ -322,17 +449,17 @@ ${text.slice(0, 3500)}
     });
 
     return safeJsonParse(resp.output_text || "{}", {
-      claim: fallbackCoreSummary(text),
-      searchQuery: fallbackCoreSummary(text).slice(0, 60),
-      coreSummary: fallbackCoreSummary(text),
-      clickbaitScore: calcClickbaitScore(text),
+      claim: fallbackCoreSummary(seedText),
+      searchQuery: fallbackCoreSummary(seedText).slice(0, 60),
+      coreSummary: fallbackCoreSummary(seedText),
+      clickbaitScore: calcClickbaitScore(seedText),
     });
   } catch {
     return {
-      claim: fallbackCoreSummary(text),
-      searchQuery: fallbackCoreSummary(text).slice(0, 60),
-      coreSummary: fallbackCoreSummary(text),
-      clickbaitScore: calcClickbaitScore(text),
+      claim: fallbackCoreSummary(seedText),
+      searchQuery: fallbackCoreSummary(seedText).slice(0, 60),
+      coreSummary: fallbackCoreSummary(seedText),
+      clickbaitScore: calcClickbaitScore(seedText),
     };
   }
 }
@@ -398,15 +525,18 @@ async function analyzeWithEvidence(args: {
   sourceDomain: string;
   searchQuery: string;
   clickbaitScore: number;
+  extractedTitle: string;
 }): Promise<AnalyzeResponse> {
   if (!openai) {
-    return fallbackAnalyze(
-      args.inputText,
-      args.sourceDomain,
-      args.extractionMethod,
-      args.evidence,
-      args.searchQuery
-    );
+    return buildFallbackResult({
+      text: args.inputText,
+      sourceDomain: args.sourceDomain,
+      extractionMethod: args.extractionMethod,
+      evidenceSources: args.evidence,
+      searchQuery: args.searchQuery,
+      extractedTitle: args.extractedTitle,
+      clickbaitScore: args.clickbaitScore,
+    });
   }
 
   const evidenceText =
@@ -439,11 +569,11 @@ async function analyzeWithEvidence(args: {
 규칙:
 - summary는 판정 한줄
 - coreSummary는 글 핵심 내용 요약
-- shareSummary는 분석 설명이 아니라 사건 내용을 자연스럽게 요약
+- shareSummary는 사건 내용 요약이어야 하고 분석 설명처럼 쓰지 말 것
 - facts는 웹 기사로 확인되는 내용 중심
-- cautions는 추정/불일치/출처 부족 같은 부분
+- cautions는 추정/불일치/출처 부족 중심
+- 본문 추출 실패 시 그 사실을 caution으로 반영할 수는 있지만 앱이 죽으면 안 됨
 - 최대한 자연스러운 한국어
-- 빈 배열 가능
 
 입력 주장:
 ${args.claim}
@@ -485,7 +615,7 @@ ${evidenceText}
       facts: [],
       cautions: [],
       coreSummary: args.coreSummary || fallbackCoreSummary(args.inputText),
-      shareSummary: fallbackShareSummary(args.inputText),
+      shareSummary: fallbackShareSummary(args.inputText, args.extractedTitle),
     });
 
     const trustScore = clamp(parsed.trustScore ?? 50);
@@ -502,7 +632,10 @@ ${evidenceText}
       coreSummary:
         parsed.coreSummary || args.coreSummary || fallbackCoreSummary(args.inputText),
       shareSummary:
-        parsed.shareSummary || args.coreSummary || fallbackShareSummary(args.inputText),
+        parsed.shareSummary ||
+        args.extractedTitle ||
+        args.coreSummary ||
+        fallbackShareSummary(args.inputText, args.extractedTitle),
       evidenceSources: args.evidence.slice(0, 5),
       meta: {
         sourceDomain: args.sourceDomain,
@@ -512,16 +645,19 @@ ${evidenceText}
         webEvidenceCount: args.evidence.length,
         webVerificationEnabled: Boolean(process.env.GNEWS_API_KEY),
         aiEnabled: true,
+        extractedTitle: args.extractedTitle,
       },
     };
   } catch {
-    return fallbackAnalyze(
-      args.inputText,
-      args.sourceDomain,
-      args.extractionMethod,
-      args.evidence,
-      args.searchQuery
-    );
+    return buildFallbackResult({
+      text: args.inputText,
+      sourceDomain: args.sourceDomain,
+      extractionMethod: args.extractionMethod,
+      evidenceSources: args.evidence,
+      searchQuery: args.searchQuery,
+      extractedTitle: args.extractedTitle,
+      clickbaitScore: args.clickbaitScore,
+    });
   }
 }
 
@@ -551,6 +687,7 @@ export async function POST(req: Request) {
             webEvidenceCount: 0,
             webVerificationEnabled: Boolean(process.env.GNEWS_API_KEY),
             aiEnabled: Boolean(process.env.OPENAI_API_KEY),
+            extractedTitle: "",
           },
         },
         { status: 400 }
@@ -560,18 +697,22 @@ export async function POST(req: Request) {
     let text = input;
     let extractionMethod: ExtractionMethod = "raw";
     let sourceDomain = "";
+    let extractedTitle = "";
 
     if (isUrl(input)) {
       const extracted = await extractFromUrl(input);
       extractionMethod = extracted.extractionMethod;
       sourceDomain = extracted.sourceDomain;
+      extractedTitle = extracted.extractedTitle;
 
-      if (extracted.text.length > 200) {
+      if (extracted.text.length > 30) {
         text = extracted.text;
+      } else {
+        text = [extractedTitle, input].filter(Boolean).join(" ");
       }
     }
 
-    const seed = await buildSearchSeed(text);
+    const seed = await buildSearchSeed(text, extractedTitle);
     const lang: "ko" | "en" = isKorean(seed.searchQuery || text) ? "ko" : "en";
     const evidence = await searchGNews(seed.searchQuery || text.slice(0, 100), lang);
 
@@ -584,11 +725,13 @@ export async function POST(req: Request) {
       sourceDomain,
       searchQuery: seed.searchQuery || "",
       clickbaitScore: clamp(seed.clickbaitScore || calcClickbaitScore(text)),
+      extractedTitle,
     });
 
     return NextResponse.json(result);
   } catch (e) {
     const message = e instanceof Error ? e.message : "unknown";
+
     return NextResponse.json(
       {
         error: "분석 실패",
@@ -600,7 +743,7 @@ export async function POST(req: Request) {
         decision: "비추천",
         summary: "분석 중 오류가 발생했습니다.",
         facts: [],
-        cautions: [],
+        cautions: ["링크 처리 중 오류가 발생했지만 앱은 계속 동작합니다."],
         coreSummary: "",
         shareSummary: "",
         evidenceSources: [],
@@ -610,6 +753,7 @@ export async function POST(req: Request) {
           webEvidenceCount: 0,
           webVerificationEnabled: Boolean(process.env.GNEWS_API_KEY),
           aiEnabled: Boolean(process.env.OPENAI_API_KEY),
+          extractedTitle: "",
         },
       },
       { status: 500 }
